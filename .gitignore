@@ -1,0 +1,11 @@
+microgpt
+microgpt-go
+microgpt_test_bin
+*.bin
+*.py
+*.log
+*.json
+*.dic
+*.txt
+*.csv
+*.mgpt
