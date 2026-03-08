@@ -14,8 +14,10 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -618,30 +620,157 @@ func trainStep(params *Params, cfg *Config, vocabSize int, tokens []int, step in
 }
 
 // ---------------------------------------------------------------------------
-// Inference (no autograd needed)
+// Batched training (data parallelism)
 // ---------------------------------------------------------------------------
 
-func softmaxF64(logits []float64) []float64 {
-	if len(logits) == 0 {
-		panic("softmaxF64: empty logits")
-	}
-	maxVal := logits[0]
-	for _, l := range logits[1:] {
-		if l > maxVal {
-			maxVal = l
+// trainWorker holds per-document state for parallel training.
+type trainWorker struct {
+	tape   *Tape
+	ws     *fwdWorkspace
+	allIdx []Idx
+	loss   Idx
+}
+
+func newTrainWorkers(n int, cfg *Config) []trainWorker {
+	workers := make([]trainWorker, n)
+	for i := range workers {
+		workers[i] = trainWorker{
+			tape: NewTape(tapeInitCap),
+			ws:   newFwdWorkspace(cfg),
 		}
 	}
-	probs := make([]float64, len(logits))
-	sum := 0.0
-	for i, l := range logits {
-		probs[i] = math.Exp(l - maxVal)
-		sum += probs[i]
-	}
-	for i := range probs {
-		probs[i] /= sum
-	}
-	return probs
+	return workers
 }
+
+// trainStepBatch processes multiple documents in parallel and performs one Adam update
+// on the averaged gradients. When len(tokensBatch)==1, it is mathematically equivalent
+// to trainStep (same gradients, same update).
+func trainStepBatch(params *Params, cfg *Config, vocabSize int, tokensBatch [][]int, step int, lrT float64, workers []trainWorker) float64 {
+	batchSize := len(tokensBatch)
+	invBatch := 1.0 / float64(batchSize)
+
+	// Phase 1: parallel forward + backward (each worker has its own tape).
+	var wg sync.WaitGroup
+	for wi := range batchSize {
+		wg.Add(1)
+		go func(wi int) {
+			defer wg.Done()
+			w := &workers[wi]
+			w.tape.Reset()
+			m, allIdx := loadModel(w.tape, params, cfg, vocabSize)
+			w.allIdx = allIdx
+			kv := newKVCache(cfg.NLayer)
+
+			tokens := tokensBatch[wi]
+			n := min(cfg.BlockSize, len(tokens)-1)
+			losses := make([]Idx, n)
+			for pos := range n {
+				logits := gptForward(w.tape, &m, cfg, tokens[pos], pos, kv, w.ws)
+				probs := softmax(w.tape, logits)
+				losses[pos] = w.tape.Neg(w.tape.Log(probs[tokens[pos+1]]))
+			}
+			w.loss = w.tape.Mul(w.tape.Leaf(1.0/float64(n)), w.tape.Sum(losses))
+			w.tape.Backward(w.loss)
+		}(wi)
+	}
+	wg.Wait()
+
+	// Average loss for reporting.
+	var avgLoss float64
+	for wi := range batchSize {
+		avgLoss += workers[wi].tape.Val(workers[wi].loss)
+	}
+	avgLoss *= invBatch
+
+	nParams := len(params.data)
+
+	// Phase 2: parallel gradient aggregation + norm computation.
+	// Split parameter range across OS threads to parallelise the reduction.
+	// For small param counts, sequential is faster than goroutine overhead.
+	nChunks := 1
+	if nParams >= 4096 {
+		nChunks = runtime.GOMAXPROCS(0)
+		if nChunks > nParams/1024 {
+			nChunks = nParams / 1024
+		}
+	}
+	chunkSize := (nParams + nChunks - 1) / nChunks
+
+	// Temporary buffer for averaged gradients (avoids re-reading from tapes in Adam).
+	avgGrad := make([]float64, nParams)
+	partialNormSq := make([]float64, nChunks)
+
+	var wg2 sync.WaitGroup
+	for c := range nChunks {
+		wg2.Add(1)
+		go func(c int) {
+			defer wg2.Done()
+			start := c * chunkSize
+			end := start + chunkSize
+			if end > nParams {
+				end = nParams
+			}
+			var localNormSq float64
+			for j := start; j < end; j++ {
+				var sum float64
+				for wi := range batchSize {
+					sum += workers[wi].tape.Grad(workers[wi].allIdx[j])
+				}
+				g := sum * invBatch
+				avgGrad[j] = g
+				localNormSq += g * g
+			}
+			partialNormSq[c] = localNormSq
+		}(c)
+	}
+	wg2.Wait()
+
+	var gradNormSq float64
+	for _, ps := range partialNormSq {
+		gradNormSq += ps
+	}
+	if math.IsNaN(gradNormSq) || math.IsInf(gradNormSq, 0) {
+		return avgLoss
+	}
+
+	clipScale := 1.0
+	if gradNorm := math.Sqrt(gradNormSq); gradNorm > gradClipNorm {
+		clipScale = gradClipNorm / gradNorm
+	}
+
+	// Phase 3: parallel Adam update.
+	s := float64(step + 1)
+	bc1 := 1 - math.Pow(beta1, s)
+	bc2 := 1 - math.Pow(beta2, s)
+
+	var wg3 sync.WaitGroup
+	for c := range nChunks {
+		wg3.Add(1)
+		go func(c int) {
+			defer wg3.Done()
+			start := c * chunkSize
+			end := start + chunkSize
+			if end > nParams {
+				end = nParams
+			}
+			for i := start; i < end; i++ {
+				g := avgGrad[i] * clipScale
+				params.m[i] = beta1*params.m[i] + (1-beta1)*g
+				params.v[i] = beta2*params.v[i] + (1-beta2)*g*g
+				mHat := params.m[i] / bc1
+				vHat := params.v[i] / bc2
+				params.data[i] -= lrT * mHat / (math.Sqrt(vHat) + epsAdam)
+			}
+		}(c)
+	}
+	wg3.Wait()
+
+	return avgLoss
+}
+
+// ---------------------------------------------------------------------------
+// Inference (no autograd needed)
+// ---------------------------------------------------------------------------
 
 func softmaxF64Into(logits, probs []float64) {
 	if len(logits) == 0 {
@@ -730,33 +859,10 @@ func dotF64(a, b []float64) float64 {
 	return s
 }
 
-func linearF64(x []float64, w [][]float64) []float64 {
-	out := make([]float64, len(w))
-	for i, row := range w {
-		out[i] = dotF64(row, x)
-	}
-	return out
-}
-
 func linearF64Into(x []float64, w [][]float64, out []float64) {
 	for i, row := range w {
 		out[i] = dotF64(row, x)
 	}
-}
-
-func rmsnormF64(x []float64) []float64 {
-	n := len(x)
-	ms := 0.0
-	for _, xi := range x {
-		ms += xi * xi
-	}
-	ms /= float64(n)
-	scale := 1.0 / math.Sqrt(ms+1e-5)
-	out := make([]float64, n)
-	for i, xi := range x {
-		out[i] = xi * scale
-	}
-	return out
 }
 
 func rmsnormF64Into(x, out []float64) {
@@ -1097,7 +1203,7 @@ func loadDocs(path string) ([]string, error) {
 
 func main() {
 	var cfg Config
-	var numSteps, numSamples int
+	var numSteps, numSamples, batchSize int
 	var lr, temperature float64
 	var dataFile, saveFile, loadFile string
 	var seedFlag int64
@@ -1114,7 +1220,13 @@ func main() {
 	flag.Int64Var(&seedFlag, "seed", 0, "random seed (0 = random)")
 	flag.StringVar(&saveFile, "save", "", "save checkpoint to file after training")
 	flag.StringVar(&loadFile, "load", "", "load checkpoint from file before training")
+	flag.IntVar(&batchSize, "batch", 1, "batch size for data-parallel training (documents per step)")
 	flag.Parse()
+
+	if batchSize < 1 {
+		fmt.Fprintf(os.Stderr, "error: -batch must be >= 1\n")
+		os.Exit(1)
+	}
 
 	var rngState, rngSeq uint64
 	if seedFlag != 0 {
@@ -1194,7 +1306,6 @@ func main() {
 		}
 
 		const maxConsecutiveSkips = 10
-		tape := NewTape(tapeInitCap)
 		var lossRing [100]float64
 		var lossSum float64
 		var skipped, consecutiveSkips int
@@ -1202,40 +1313,89 @@ func main() {
 		trainStart := time.Now()
 		etaUpdated := trainStart
 		stepsRan := numSteps
-		for i := range numSteps {
-			step := lastStep + i
-			j := i % len(tokenized)
-			if j == 0 {
-				rng.Shuffle(len(perm), func(a, b int) { perm[a], perm[b] = perm[b], perm[a] })
-			}
-			tokens := tokenized[perm[j]]
-			lrT := computeLR(lr, step-trainStartStep, numSteps)
-			loss := trainStep(params, &cfg, tok.vocabSize, tokens, step, lrT, tape)
-			if math.IsNaN(loss) || math.IsInf(loss, 0) {
-				skipped++
-				consecutiveSkips++
-				if consecutiveSkips >= maxConsecutiveSkips {
-					fmt.Printf("\n%d consecutive bad batches — gradient explosion, stopping early\n", consecutiveSkips)
-					stepsRan = i - consecutiveSkips + 1
-					break
+
+		if batchSize == 1 {
+			// Single-document path: identical to original behaviour.
+			tape := NewTape(tapeInitCap)
+			for i := range numSteps {
+				step := lastStep + i
+				j := i % len(tokenized)
+				if j == 0 {
+					rng.Shuffle(len(perm), func(a, b int) { perm[a], perm[b] = perm[b], perm[a] })
 				}
-				continue
+				tokens := tokenized[perm[j]]
+				lrT := computeLR(lr, step-trainStartStep, numSteps)
+				loss := trainStep(params, &cfg, tok.vocabSize, tokens, step, lrT, tape)
+				if math.IsNaN(loss) || math.IsInf(loss, 0) {
+					skipped++
+					consecutiveSkips++
+					if consecutiveSkips >= maxConsecutiveSkips {
+						fmt.Printf("\n%d consecutive bad batches — gradient explosion, stopping early\n", consecutiveSkips)
+						stepsRan = i - consecutiveSkips + 1
+						break
+					}
+					continue
+				}
+				consecutiveSkips = 0
+				lossSum += loss
+				if i >= 100 {
+					lossSum -= lossRing[i%100]
+				}
+				lossRing[i%100] = loss
+				window := min(i+1, 100)
+				now := time.Now()
+				if i >= 10000 && now.Sub(etaUpdated) >= time.Second {
+					avgStep := now.Sub(trainStart) / time.Duration(i+1)
+					remaining := avgStep * time.Duration(numSteps-i-1)
+					etaStr = " | eta " + remaining.Round(time.Second).String()
+					etaUpdated = now
+				}
+				fmt.Printf("\rstep %4d / %4d | loss %.4f | avg100 %.4f%s\x1b[K", i+1, numSteps, loss, lossSum/float64(window), etaStr)
 			}
-			consecutiveSkips = 0
-			lossSum += loss
-			if i >= 100 {
-				lossSum -= lossRing[i%100]
+		} else {
+			// Batched data-parallel path.
+			workers := newTrainWorkers(batchSize, &cfg)
+			tokensBatch := make([][]int, batchSize)
+			j := 0 // cursor into perm
+			for i := range numSteps {
+				step := lastStep + i
+				// Fill batch, reshuffling at epoch boundaries.
+				for b := range batchSize {
+					if j%len(tokenized) == 0 {
+						rng.Shuffle(len(perm), func(a, c int) { perm[a], perm[c] = perm[c], perm[a] })
+						j = 0
+					}
+					tokensBatch[b] = tokenized[perm[j%len(tokenized)]]
+					j++
+				}
+				lrT := computeLR(lr, step-trainStartStep, numSteps)
+				loss := trainStepBatch(params, &cfg, tok.vocabSize, tokensBatch, step, lrT, workers)
+				if math.IsNaN(loss) || math.IsInf(loss, 0) {
+					skipped++
+					consecutiveSkips++
+					if consecutiveSkips >= maxConsecutiveSkips {
+						fmt.Printf("\n%d consecutive bad batches — gradient explosion, stopping early\n", consecutiveSkips)
+						stepsRan = i - consecutiveSkips + 1
+						break
+					}
+					continue
+				}
+				consecutiveSkips = 0
+				lossSum += loss
+				if i >= 100 {
+					lossSum -= lossRing[i%100]
+				}
+				lossRing[i%100] = loss
+				window := min(i+1, 100)
+				now := time.Now()
+				if i >= 10000 && now.Sub(etaUpdated) >= time.Second {
+					avgStep := now.Sub(trainStart) / time.Duration(i+1)
+					remaining := avgStep * time.Duration(numSteps-i-1)
+					etaStr = " | eta " + remaining.Round(time.Second).String()
+					etaUpdated = now
+				}
+				fmt.Printf("\rstep %4d / %4d | loss %.4f | avg100 %.4f%s\x1b[K", i+1, numSteps, loss, lossSum/float64(window), etaStr)
 			}
-			lossRing[i%100] = loss
-			window := min(i+1, 100)
-			now := time.Now()
-			if i >= 10000 && now.Sub(etaUpdated) >= time.Second {
-				avgStep := now.Sub(trainStart) / time.Duration(i+1)
-				remaining := avgStep * time.Duration(numSteps-i-1)
-				etaStr = " | eta " + remaining.Round(time.Second).String()
-				etaUpdated = now
-			}
-			fmt.Printf("\rstep %4d / %4d | loss %.4f | avg100 %.4f%s\x1b[K", i+1, numSteps, loss, lossSum/float64(window), etaStr)
 		}
 		trainElapsed := time.Since(trainStart)
 		numSteps = stepsRan
@@ -1247,9 +1407,11 @@ func main() {
 		fmt.Printf("total time:    %v\n", trainElapsed.Round(time.Millisecond))
 		fmt.Printf("avg step:      %v\n", (trainElapsed / time.Duration(numSteps)).Round(time.Microsecond))
 		fmt.Printf("throughput:    %.1f steps/sec\n", float64(numSteps)/trainElapsed.Seconds())
-		tapeBytes := cap(tape.nodes)*32 + cap(tape.dotBuf)*4 + cap(tape.dotMeta)*4
-		fmt.Printf("tape nodes:    %d (peak per step)\n", cap(tape.nodes))
-		fmt.Printf("tape memory:   %.1f MB\n", float64(tapeBytes)/(1024*1024))
+		if batchSize > 1 {
+			fmt.Printf("batch size:    %d (data-parallel)\n", batchSize)
+			docsTotal := int64(numSteps) * int64(batchSize)
+			fmt.Printf("docs/sec:      %.1f\n", float64(docsTotal)/trainElapsed.Seconds())
+		}
 
 		lastStep += numSteps
 	}

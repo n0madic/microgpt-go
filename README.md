@@ -65,6 +65,7 @@ The entire model — autograd, tokenizer, transformer, optimizer, checkpoint, in
 | `-temp` | `0.5` | Sampling temperature |
 | `-samples` | `20` | Number of generated samples |
 | `-seed` | `0` | Random seed (0 = random) |
+| `-batch` | `1` | Batch size for data-parallel training |
 | `-save` | | Save checkpoint after training |
 | `-load` | | Load checkpoint before training |
 
@@ -83,6 +84,16 @@ The entire model — autograd, tokenizer, transformer, optimizer, checkpoint, in
   -data words.txt \
   -embd 128 -heads 4 -layers 4 -ctx 48 \
   -steps 2000000 -lr 0.003 \
+  -save model.bin
+```
+
+**Train with data-parallel batching (4 documents per step):**
+
+```bash
+./microgpt \
+  -data words.txt \
+  -embd 128 -heads 4 -layers 4 -ctx 48 \
+  -steps 500000 -lr 0.003 -batch 4 \
   -save model.bin
 ```
 
@@ -127,16 +138,20 @@ Hyperparameters, tokenizer, and optimizer state are all restored automatically o
 - **Bad batch recovery**: NaN/Inf gradients skip Adam update (params preserved); 10 consecutive → early stop
 - **Epoch shuffle**: dataset reshuffled each epoch, every sample seen exactly once per epoch
 - **Circular loss buffer**: fixed-size ring buffer for running average (constant memory regardless of step count)
+- **Data-parallel batching** (`-batch N`): processes N documents in parallel using separate tapes per worker, averages gradients, and performs a single Adam update per step. With `-batch 1` (default), training is identical to the original sequential path. Gradient aggregation and Adam updates are also parallelised across CPU cores for large models (≥4K params).
 
 ## Performance
 
-Benchmarks on the default config (1 layer, embd=16, ctx=16, vocab=27):
+Benchmarks on the default config (1 layer, embd=16, ctx=16, vocab=27, Apple M1 Pro):
 
-| | Training step | Inference (generate) |
-|---|---|---|
-| Latency | ~155 μs | ~32 μs |
-| Memory | ~25 KB | ~10 KB |
-| Allocs | ~87 | ~46 |
+| | Training step (batch=1) | Training step (batch=4) | Inference (generate) |
+|---|---|---|---|
+| Latency | ~158 μs | ~280 μs (4 docs) | ~32 μs |
+| Per-document | ~158 μs | ~70 μs (**2.25x**) | — |
+| Memory | ~25 KB | ~131 KB | ~10 KB |
+| Allocs | ~87 | ~328 | ~46 |
+
+> **Note on batch mode:** Each step with `-batch N` processes N documents, so to see the same amount of data you need proportionally fewer steps. For example, `50000` steps at batch=1 sees 50K documents; the equivalent is `6250` steps at batch=8 — but ~3.6x faster in wall time. The speedup grows with model size; for larger models (embd=128+, layers=4+) expect near-linear scaling with CPU cores as forward+backward dominates over goroutine overhead.
 
 Key optimizations:
 - **Workspace structs** (`fwdWorkspace`, `inferWorkspace`): pre-allocated buffers reused across positions/samples, eliminating per-call allocations in forward passes
@@ -154,7 +169,7 @@ go test -bench=. -benchmem
 
 Test coverage:
 - Numerical gradient verification for all tape ops (Add, Mul, Pow, Log, Exp, ReLU, Neg, Sub, Div, Dot, Sum)
-- Deterministic training (same seed → identical losses)
+- Deterministic training (same seed → identical losses, both single and batch modes)
 - Tape reuse correctness
 - Inference-vs-training forward pass consistency
 - Checkpoint round-trip (save/load/resume)
@@ -163,6 +178,7 @@ Test coverage:
 - Long line handling in data loading (100KB+ lines)
 - LR schedule correctness (warmup/decay boundaries)
 - Generate completes without panic on fresh params
+- Batch training: single-equivalence, determinism, quality (loss decreases)
 
 ## License
 

@@ -520,3 +520,136 @@ func BenchmarkGenerate(b *testing.B) {
 		generate(params, tok, cfg, 0.5, rng)
 	}
 }
+
+// --- Batch training tests ---
+
+// TestTrainStepBatchSingleEquivalence verifies that trainStepBatch with batch=1
+// produces identical results to trainStep for the same document.
+func TestTrainStepBatchSingleEquivalence(t *testing.T) {
+	cfg := testConfig()
+
+	docs := []string{"emma", "olivia", "ava", "sophia", "isabella"}
+
+	for step := range 3 {
+		// Run trainStep
+		rng1 := rand.New(rand.NewPCG(42, 0))
+		tok1 := NewTokenizer(docs)
+		params1 := NewParams(cfg, tok1.vocabSize, rng1)
+		tokens := tok1.Encode(docs[step%len(docs)])
+		lrT := computeLR(0.01, step, 10)
+		loss1 := trainStep(params1, cfg, tok1.vocabSize, tokens, step, lrT, nil)
+
+		// Run trainStepBatch with batch=1
+		rng2 := rand.New(rand.NewPCG(42, 0))
+		tok2 := NewTokenizer(docs)
+		params2 := NewParams(cfg, tok2.vocabSize, rng2)
+		tokens2 := tok2.Encode(docs[step%len(docs)])
+		workers := newTrainWorkers(1, cfg)
+		loss2 := trainStepBatch(params2, cfg, tok2.vocabSize, [][]int{tokens2}, step, lrT, workers)
+
+		if loss1 != loss2 {
+			t.Fatalf("step %d: trainStep loss=%.10f != trainStepBatch loss=%.10f", step, loss1, loss2)
+		}
+		// Verify parameters are identical
+		for i := range params1.data {
+			if params1.data[i] != params2.data[i] {
+				t.Fatalf("step %d: param[%d] differs: %.10f vs %.10f", step, i, params1.data[i], params2.data[i])
+			}
+		}
+	}
+}
+
+// TestTrainStepBatchDeterministic verifies that trainStepBatch with batch>1
+// produces identical results across runs with the same seed.
+func TestTrainStepBatchDeterministic(t *testing.T) {
+	cfg := testConfig()
+	docs := []string{"emma", "olivia", "ava", "sophia", "isabella"}
+
+	run := func() []float64 {
+		rng := rand.New(rand.NewPCG(99, 0))
+		tok := NewTokenizer(docs)
+		params := NewParams(cfg, tok.vocabSize, rng)
+		tokenized := make([][]int, len(docs))
+		for i, doc := range docs {
+			tokenized[i] = tok.Encode(doc)
+		}
+		workers := newTrainWorkers(2, cfg)
+		losses := make([]float64, 5)
+		for step := range 5 {
+			batch := [][]int{
+				tokenized[step%len(tokenized)],
+				tokenized[(step+1)%len(tokenized)],
+			}
+			lrT := computeLR(0.01, step, 5)
+			losses[step] = trainStepBatch(params, cfg, tok.vocabSize, batch, step, lrT, workers)
+		}
+		return losses
+	}
+
+	losses1 := run()
+	losses2 := run()
+	for i := range losses1 {
+		if losses1[i] != losses2[i] {
+			t.Fatalf("step %d: loss %.10f != %.10f", i, losses1[i], losses2[i])
+		}
+	}
+}
+
+// TestTrainStepBatchQuality verifies that batch training reduces loss over time.
+func TestTrainStepBatchQuality(t *testing.T) {
+	cfg := testConfig()
+	rng := rand.New(rand.NewPCG(42, 0))
+	docs := []string{"emma", "olivia", "ava", "sophia", "isabella"}
+	tok := NewTokenizer(docs)
+	params := NewParams(cfg, tok.vocabSize, rng)
+	tokenized := make([][]int, len(docs))
+	for i, doc := range docs {
+		tokenized[i] = tok.Encode(doc)
+	}
+
+	workers := newTrainWorkers(2, cfg)
+	numSteps := 100
+	var firstLoss, lastLoss float64
+	for step := range numSteps {
+		batch := [][]int{
+			tokenized[step%len(tokenized)],
+			tokenized[(step+1)%len(tokenized)],
+		}
+		lrT := computeLR(0.01, step, numSteps)
+		loss := trainStepBatch(params, cfg, tok.vocabSize, batch, step, lrT, workers)
+		if step == 0 {
+			firstLoss = loss
+		}
+		if step == numSteps-1 {
+			lastLoss = loss
+		}
+	}
+	if lastLoss >= firstLoss {
+		t.Fatalf("loss did not decrease: first=%.4f last=%.4f", firstLoss, lastLoss)
+	}
+}
+
+func BenchmarkTrainStepBatch(b *testing.B) {
+	cfg := testConfig()
+
+	rng := rand.New(rand.NewPCG(42, 0))
+	docs := []string{"emma", "olivia", "ava", "sophia", "isabella"}
+	tok := NewTokenizer(docs)
+	params := NewParams(cfg, tok.vocabSize, rng)
+
+	tokenized := make([][]int, len(docs))
+	for i, doc := range docs {
+		tokenized[i] = tok.Encode(doc)
+	}
+
+	workers := newTrainWorkers(4, cfg)
+	batch := make([][]int, 4)
+	b.ResetTimer()
+	for i := range b.N {
+		for j := range 4 {
+			batch[j] = tokenized[(i*4+j)%len(tokenized)]
+		}
+		lrT := computeLR(0.01, i%100, 100)
+		trainStepBatch(params, cfg, tok.vocabSize, batch, i, lrT, workers)
+	}
+}
