@@ -33,7 +33,7 @@ The entire model — autograd, tokenizer, transformer, optimizer, checkpoint, in
 - GPT-2 style transformer with RMSNorm (no biases, ReLU instead of GeLU)
 - Character-level tokenizer with BOS token
 - Multi-head causal attention with KV-cache
-- Adam optimizer with linear warmup + decay
+- AdamW optimizer with decoupled weight decay, linear warmup + decay
 - `Config` struct holds all hyperparameters — no global mutable state
 
 **Key differences from the Python original:**
@@ -47,7 +47,7 @@ The entire model — autograd, tokenizer, transformer, optimizer, checkpoint, in
 | Pow exponents | Python dict | Dense slice (indexed via node field) |
 | Inference | Full autograd overhead | Tape-free pure float64 with workspace reuse |
 | Tape reuse | New graph every step | `Reset()` keeps backing arrays |
-| Allocations | Per-call slices | Pre-allocated workspace structs |
+| Allocations | Per-call slices | Pre-allocated workspace structs + KV pool |
 | Unicode | Python str (native) | Rune-based tokenizer (full UTF-8) |
 | Checkpoints | None | Binary save/load with resume + validation |
 
@@ -66,6 +66,7 @@ The entire model — autograd, tokenizer, transformer, optimizer, checkpoint, in
 | `-samples` | `20` | Number of generated samples |
 | `-seed` | `0` | Random seed (0 = random) |
 | `-batch` | `1` | Batch size for data-parallel training |
+| `-wd` | `0` | Weight decay (AdamW decoupled L2, 0 = disabled) |
 | `-save` | | Save checkpoint after training |
 | `-load` | | Load checkpoint before training |
 
@@ -77,13 +78,13 @@ The entire model — autograd, tokenizer, transformer, optimizer, checkpoint, in
 ./microgpt -steps 5000
 ```
 
-**Train a larger model on a custom dataset:**
+**Train a larger model on a custom dataset (with weight decay):**
 
 ```bash
 ./microgpt \
   -data words.txt \
   -embd 128 -heads 4 -layers 4 -ctx 48 \
-  -steps 2000000 -lr 0.003 \
+  -steps 2000000 -lr 0.003 -wd 0.01 \
   -save model.bin
 ```
 
@@ -133,8 +134,9 @@ Hyperparameters, tokenizer, and optimizer state are all restored automatically o
 
 ## Training features
 
-- **LR schedule**: `computeLR()` — linear warmup (5%) → linear decay to zero
+- **LR schedule**: `computeLR()` — linear warmup (5%) → linear decay to zero (safe for `totalSteps=0`)
 - **Gradient clipping**: global L2 norm capped at 1.0
+- **Weight decay** (`-wd`): AdamW decoupled L2 regularization — `θ *= (1 - lr × wd)` before Adam step. Default 0 (disabled), recommended 0.01–0.1 for larger models
 - **Bad batch recovery**: NaN/Inf gradients skip Adam update (params preserved); 10 consecutive → early stop
 - **Epoch shuffle**: dataset reshuffled each epoch, every sample seen exactly once per epoch
 - **Circular loss buffer**: fixed-size ring buffer for running average (constant memory regardless of step count)
@@ -155,7 +157,9 @@ Benchmarks on the default config (1 layer, embd=16, ctx=16, vocab=27, Apple M1 P
 
 Key optimizations:
 - **Workspace structs** (`fwdWorkspace`, `inferWorkspace`): pre-allocated buffers reused across positions/samples, eliminating per-call allocations in forward passes
-- **`Into` function variants** (`linearInto`, `rmsnormInto`, `softmaxF64Into`, etc.): write into provided buffers instead of allocating
+- **KV cache pooling**: `kvCache` and `inferKV` pre-allocate a flat buffer for all KV entries, eliminating `2 × nLayer × nPositions` allocations per step
+- **`Into` function variants** (`linearInto`, `rmsnormInto`, `softmaxInto`, `softmaxF64Into`, etc.): write into provided buffers instead of allocating
+- **Cached tape constants**: rmsnorm's `1/n` and `ε` leaves are created once per forward call and reused across all layers/positions
 - **Dense `powExps` slice**: replaces `map[Idx]float64` for pow exponents, eliminating map lookups in backward pass hot path
 - **Tape reuse**: `Reset()` clears nodes but keeps backing arrays across training steps
 
@@ -176,7 +180,8 @@ Test coverage:
 - Checkpoint validation (bad magic, huge allocations, invalid hyperparams)
 - Tokenizer edge cases (single-char documents, encode/decode roundtrip)
 - Long line handling in data loading (100KB+ lines)
-- LR schedule correctness (warmup/decay boundaries)
+- LR schedule correctness (warmup/decay boundaries, `totalSteps=0` edge case)
+- Weight decay reduces parameter norm vs no decay
 - Generate completes without panic on fresh params
 - Batch training: single-equivalence, determinism, quality (loss decreases)
 

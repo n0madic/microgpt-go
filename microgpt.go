@@ -30,6 +30,7 @@ const (
 	tapeInitCap  = 50_000
 	gradClipNorm = 1.0  // max global gradient L2 norm
 	warmupFrac   = 0.05 // fraction of training steps for LR warmup (0→lr)
+	mlpMul       = 4    // MLP hidden layer expansion factor
 )
 
 // Config holds model hyperparameters, eliminating global mutable state.
@@ -316,6 +317,15 @@ type Model struct {
 type kvCache struct {
 	keys   [][][]Idx
 	values [][][]Idx
+	buf    []Idx // pre-allocated backing storage
+	off    int
+}
+
+// slice returns the next n elements from the pre-allocated buffer.
+func (kv *kvCache) slice(n int) []Idx {
+	s := kv.buf[kv.off : kv.off+n : kv.off+n]
+	kv.off += n
+	return s
 }
 
 func NewParams(cfg *Config, vocabSize int, rng *rand.Rand) *Params {
@@ -326,8 +336,8 @@ func NewParams(cfg *Config, vocabSize int, rng *rand.Rand) *Params {
 			cfg.NEmbd*cfg.NEmbd+ // attnWK
 			cfg.NEmbd*cfg.NEmbd+ // attnWV
 			cfg.NEmbd*cfg.NEmbd+ // attnWO
-			4*cfg.NEmbd*cfg.NEmbd+ // mlpFC1
-			cfg.NEmbd*4*cfg.NEmbd) // mlpFC2
+			mlpMul*cfg.NEmbd*cfg.NEmbd+ // mlpFC1
+			cfg.NEmbd*mlpMul*cfg.NEmbd) // mlpFC2
 
 	data := make([]float64, n)
 	for i := range data {
@@ -364,17 +374,18 @@ func loadModel(t *Tape, p *Params, cfg *Config, vocabSize int) (Model, []Idx) {
 			attnWK: matrix(cfg.NEmbd, cfg.NEmbd),
 			attnWV: matrix(cfg.NEmbd, cfg.NEmbd),
 			attnWO: matrix(cfg.NEmbd, cfg.NEmbd),
-			mlpFC1: matrix(4*cfg.NEmbd, cfg.NEmbd),
-			mlpFC2: matrix(cfg.NEmbd, 4*cfg.NEmbd),
+			mlpFC1: matrix(mlpMul*cfg.NEmbd, cfg.NEmbd),
+			mlpFC2: matrix(cfg.NEmbd, mlpMul*cfg.NEmbd),
 		}
 	}
 	return mdl, allIdx
 }
 
-func newKVCache(nLayer int) *kvCache {
+func newKVCache(nLayer, blockSize, nEmbd int) *kvCache {
 	return &kvCache{
 		keys:   make([][][]Idx, nLayer),
 		values: make([][][]Idx, nLayer),
+		buf:    make([]Idx, 2*nLayer*blockSize*nEmbd),
 	}
 }
 
@@ -437,13 +448,12 @@ func rmsnorm(t *Tape, x []Idx) []Idx {
 	return out
 }
 
-func rmsnormInto(t *Tape, x, sq, out []Idx) {
-	n := len(x)
+func rmsnormInto(t *Tape, x, sq, out []Idx, invN, eps Idx) {
 	for i, xi := range x {
 		sq[i] = t.Mul(xi, xi)
 	}
-	ms := t.Mul(t.Sum(sq[:n]), t.Leaf(1.0/float64(n)))
-	scale := t.Pow(t.Add(ms, t.Leaf(1e-5)), -0.5)
+	ms := t.Mul(t.Sum(sq[:len(x)]), invN)
+	scale := t.Pow(t.Add(ms, eps), -0.5)
 	for i, xi := range x {
 		out[i] = t.Mul(xi, scale)
 	}
@@ -457,9 +467,11 @@ type fwdWorkspace struct {
 	x, xRes    []Idx // [nEmbd]
 	q, k, v    []Idx // [nEmbd]
 	xAttn      []Idx // [nEmbd]
-	hidden     []Idx // [4*nEmbd]
+	hidden     []Idx // [mlpMul*nEmbd]
 	normSq     []Idx // [nEmbd] — rmsnorm scratch
 	attnLogits []Idx // [blockSize] — attention scores per head
+	attnExps   []Idx // [blockSize] — softmax scratch for attention
+	attnProbs  []Idx // [blockSize] — softmax output for attention
 	prods      []Idx // [blockSize] — weighted sum products per head
 }
 
@@ -471,10 +483,31 @@ func newFwdWorkspace(cfg *Config) *fwdWorkspace {
 		k:          make([]Idx, cfg.NEmbd),
 		v:          make([]Idx, cfg.NEmbd),
 		xAttn:      make([]Idx, cfg.NEmbd),
-		hidden:     make([]Idx, 4*cfg.NEmbd),
+		hidden:     make([]Idx, mlpMul*cfg.NEmbd),
 		normSq:     make([]Idx, cfg.NEmbd),
 		attnLogits: make([]Idx, cfg.BlockSize),
+		attnExps:   make([]Idx, cfg.BlockSize),
+		attnProbs:  make([]Idx, cfg.BlockSize),
 		prods:      make([]Idx, cfg.BlockSize),
+	}
+}
+
+// softmaxInto computes softmax writing to pre-allocated exps and probs slices.
+func softmaxInto(t *Tape, logits, exps, probs []Idx) {
+	n := len(logits)
+	maxVal := t.Val(logits[0])
+	for _, l := range logits[1:] {
+		if v := t.Val(l); v > maxVal {
+			maxVal = v
+		}
+	}
+	maxC := t.Leaf(maxVal)
+	for i, l := range logits {
+		exps[i] = t.Exp(t.Sub(l, maxC))
+	}
+	total := t.Sum(exps[:n])
+	for i, e := range exps[:n] {
+		probs[i] = t.Div(e, total)
 	}
 }
 
@@ -483,13 +516,21 @@ func newFwdWorkspace(cfg *Config) *fwdWorkspace {
 // ---------------------------------------------------------------------------
 
 func gptForward(t *Tape, m *Model, cfg *Config, tokenID, posID int, kv *kvCache, ws *fwdWorkspace) []Idx {
+	if posID < 0 || posID >= cfg.BlockSize {
+		panic(fmt.Sprintf("gptForward: posID %d out of range [0, %d)", posID, cfg.BlockSize))
+	}
+
+	// Cached constants for rmsnorm (created once per forward call, reused across layers)
+	invN := t.Leaf(1.0 / float64(cfg.NEmbd))
+	eps := t.Leaf(1e-5)
+
 	// Token + position embedding
 	tokEmb := m.wte[tokenID]
 	posEmb := m.wpe[posID]
 	for i := range cfg.NEmbd {
 		ws.x[i] = t.Add(tokEmb[i], posEmb[i])
 	}
-	rmsnormInto(t, ws.x, ws.normSq, ws.x)
+	rmsnormInto(t, ws.x, ws.normSq, ws.x, invN, eps)
 
 	scale := t.Leaf(1.0 / math.Sqrt(float64(cfg.HeadDim)))
 
@@ -498,15 +539,15 @@ func gptForward(t *Tape, m *Model, cfg *Config, tokenID, posID int, kv *kvCache,
 
 		// --- Multi-head attention ---
 		copy(ws.xRes, ws.x)
-		rmsnormInto(t, ws.x, ws.normSq, ws.x)
+		rmsnormInto(t, ws.x, ws.normSq, ws.x, invN, eps)
 		linearInto(t, ws.x, layer.attnWQ, ws.q)
 		linearInto(t, ws.x, layer.attnWK, ws.k)
 		linearInto(t, ws.x, layer.attnWV, ws.v)
 
-		// KV cache entries must persist across positions — allocate per position
-		kEntry := make([]Idx, cfg.NEmbd)
+		// KV cache entries must persist across positions — slice from pre-allocated buffer
+		kEntry := kv.slice(cfg.NEmbd)
 		copy(kEntry, ws.k)
-		vEntry := make([]Idx, cfg.NEmbd)
+		vEntry := kv.slice(cfg.NEmbd)
 		copy(vEntry, ws.v)
 		kv.keys[li] = append(kv.keys[li], kEntry)
 		kv.values[li] = append(kv.values[li], vEntry)
@@ -520,11 +561,11 @@ func gptForward(t *Tape, m *Model, cfg *Config, tokenID, posID int, kv *kvCache,
 				kH := kv.keys[li][p][hs : hs+cfg.HeadDim]
 				ws.attnLogits[p] = t.Mul(t.Dot(qH, kH), scale)
 			}
-			attnWeights := softmax(t, ws.attnLogits[:nPos])
+			softmaxInto(t, ws.attnLogits[:nPos], ws.attnExps[:nPos], ws.attnProbs[:nPos])
 
 			for j := range cfg.HeadDim {
 				for p := range nPos {
-					ws.prods[p] = t.Mul(attnWeights[p], kv.values[li][p][hs+j])
+					ws.prods[p] = t.Mul(ws.attnProbs[p], kv.values[li][p][hs+j])
 				}
 				ws.xAttn[hs+j] = t.Sum(ws.prods[:nPos])
 			}
@@ -536,7 +577,7 @@ func gptForward(t *Tape, m *Model, cfg *Config, tokenID, posID int, kv *kvCache,
 
 		// --- MLP ---
 		copy(ws.xRes, ws.x)
-		rmsnormInto(t, ws.x, ws.normSq, ws.x)
+		rmsnormInto(t, ws.x, ws.normSq, ws.x, invN, eps)
 		linearInto(t, ws.x, layer.mlpFC1, ws.hidden)
 		for i := range ws.hidden {
 			ws.hidden[i] = t.ReLU(ws.hidden[i])
@@ -556,15 +597,22 @@ func gptForward(t *Tape, m *Model, cfg *Config, tokenID, posID int, kv *kvCache,
 
 // computeLR returns the learning rate for the given step using linear warmup + linear decay.
 func computeLR(baseLR float64, relStep, totalSteps int) float64 {
+	if totalSteps <= 0 {
+		return 0
+	}
 	warmup := float64(totalSteps) * warmupFrac
 	rel := float64(relStep)
 	if warmup > 0 && rel < warmup {
 		return baseLR * rel / warmup
 	}
-	return baseLR * (float64(totalSteps) - rel) / (float64(totalSteps) - warmup)
+	decay := float64(totalSteps) - warmup
+	if decay <= 0 {
+		return baseLR
+	}
+	return baseLR * (float64(totalSteps) - rel) / decay
 }
 
-func trainStep(params *Params, cfg *Config, vocabSize int, tokens []int, step int, lrT float64, tape *Tape) float64 {
+func trainStep(params *Params, cfg *Config, vocabSize int, tokens []int, step int, lrT, weightDecay float64, tape *Tape) float64 {
 	var t *Tape
 	if tape != nil {
 		t = tape
@@ -573,7 +621,7 @@ func trainStep(params *Params, cfg *Config, vocabSize int, tokens []int, step in
 		t = NewTape(tapeInitCap)
 	}
 	m, allIdx := loadModel(t, params, cfg, vocabSize)
-	kv := newKVCache(cfg.NLayer)
+	kv := newKVCache(cfg.NLayer, cfg.BlockSize, cfg.NEmbd)
 	ws := newFwdWorkspace(cfg)
 
 	n := min(cfg.BlockSize, len(tokens)-1)
@@ -613,6 +661,9 @@ func trainStep(params *Params, cfg *Config, vocabSize int, tokens []int, step in
 		params.v[i] = beta2*params.v[i] + (1-beta2)*g*g
 		mHat := params.m[i] / bc1
 		vHat := params.v[i] / bc2
+		if weightDecay > 0 {
+			params.data[i] *= 1 - lrT*weightDecay
+		}
 		params.data[i] -= lrT * mHat / (math.Sqrt(vHat) + epsAdam)
 	}
 
@@ -645,7 +696,7 @@ func newTrainWorkers(n int, cfg *Config) []trainWorker {
 // trainStepBatch processes multiple documents in parallel and performs one Adam update
 // on the averaged gradients. When len(tokensBatch)==1, it is mathematically equivalent
 // to trainStep (same gradients, same update).
-func trainStepBatch(params *Params, cfg *Config, vocabSize int, tokensBatch [][]int, step int, lrT float64, workers []trainWorker) float64 {
+func trainStepBatch(params *Params, cfg *Config, vocabSize int, tokensBatch [][]int, step int, lrT, weightDecay float64, workers []trainWorker) float64 {
 	batchSize := len(tokensBatch)
 	invBatch := 1.0 / float64(batchSize)
 
@@ -659,7 +710,7 @@ func trainStepBatch(params *Params, cfg *Config, vocabSize int, tokensBatch [][]
 			w.tape.Reset()
 			m, allIdx := loadModel(w.tape, params, cfg, vocabSize)
 			w.allIdx = allIdx
-			kv := newKVCache(cfg.NLayer)
+			kv := newKVCache(cfg.NLayer, cfg.BlockSize, cfg.NEmbd)
 
 			tokens := tokensBatch[wi]
 			n := min(cfg.BlockSize, len(tokens)-1)
@@ -759,6 +810,9 @@ func trainStepBatch(params *Params, cfg *Config, vocabSize int, tokensBatch [][]
 				params.v[i] = beta2*params.v[i] + (1-beta2)*g*g
 				mHat := params.m[i] / bc1
 				vHat := params.v[i] / bc2
+				if weightDecay > 0 {
+					params.data[i] *= 1 - lrT*weightDecay
+				}
 				params.data[i] -= lrT * mHat / (math.Sqrt(vHat) + epsAdam)
 			}
 		}(c)
@@ -820,6 +874,23 @@ type inferModel struct {
 
 type inferKV struct {
 	keys, values [][][]float64
+	buf          []float64 // pre-allocated backing storage
+	off          int
+}
+
+// slice returns the next n elements from the pre-allocated buffer.
+func (kv *inferKV) slice(n int) []float64 {
+	s := kv.buf[kv.off : kv.off+n : kv.off+n]
+	kv.off += n
+	return s
+}
+
+func newInferKV(nLayer, blockSize, nEmbd int) *inferKV {
+	return &inferKV{
+		keys:   make([][][]float64, nLayer),
+		values: make([][][]float64, nLayer),
+		buf:    make([]float64, 2*nLayer*blockSize*nEmbd),
+	}
 }
 
 func loadInferModel(p *Params, cfg *Config, vocabSize int) inferModel {
@@ -844,8 +915,8 @@ func loadInferModel(p *Params, cfg *Config, vocabSize int) inferModel {
 			attnWK: matrix(cfg.NEmbd, cfg.NEmbd),
 			attnWV: matrix(cfg.NEmbd, cfg.NEmbd),
 			attnWO: matrix(cfg.NEmbd, cfg.NEmbd),
-			mlpFC1: matrix(4*cfg.NEmbd, cfg.NEmbd),
-			mlpFC2: matrix(cfg.NEmbd, 4*cfg.NEmbd),
+			mlpFC1: matrix(mlpMul*cfg.NEmbd, cfg.NEmbd),
+			mlpFC2: matrix(cfg.NEmbd, mlpMul*cfg.NEmbd),
 		}
 	}
 	return mdl
@@ -886,7 +957,7 @@ type inferWorkspace struct {
 	x, xRes    []float64 // [nEmbd]
 	q, k, v    []float64 // [nEmbd]
 	xAttn      []float64 // [nEmbd]
-	hidden     []float64 // [4*nEmbd]
+	hidden     []float64 // [mlpMul*nEmbd]
 	attnLogits []float64 // [blockSize]
 	attnW      []float64 // [blockSize] — softmax output
 	logits     []float64 // [vocabSize]
@@ -901,7 +972,7 @@ func newInferWorkspace(cfg *Config, vocabSize int) *inferWorkspace {
 		k:          make([]float64, cfg.NEmbd),
 		v:          make([]float64, cfg.NEmbd),
 		xAttn:      make([]float64, cfg.NEmbd),
-		hidden:     make([]float64, 4*cfg.NEmbd),
+		hidden:     make([]float64, mlpMul*cfg.NEmbd),
 		attnLogits: make([]float64, cfg.BlockSize),
 		attnW:      make([]float64, cfg.BlockSize),
 		logits:     make([]float64, vocabSize),
@@ -910,6 +981,9 @@ func newInferWorkspace(cfg *Config, vocabSize int) *inferWorkspace {
 }
 
 func gptForwardF64(m *inferModel, cfg *Config, tokenID, posID int, kv *inferKV, ws *inferWorkspace) {
+	if posID < 0 || posID >= cfg.BlockSize {
+		panic(fmt.Sprintf("gptForwardF64: posID %d out of range [0, %d)", posID, cfg.BlockSize))
+	}
 	tokEmb := m.wte[tokenID]
 	posEmb := m.wpe[posID]
 	for i := range cfg.NEmbd {
@@ -928,10 +1002,10 @@ func gptForwardF64(m *inferModel, cfg *Config, tokenID, posID int, kv *inferKV, 
 		linearF64Into(ws.x, layer.attnWK, ws.k)
 		linearF64Into(ws.x, layer.attnWV, ws.v)
 
-		// KV cache entries must persist
-		kEntry := make([]float64, cfg.NEmbd)
+		// KV cache entries must persist — slice from pre-allocated buffer
+		kEntry := kv.slice(cfg.NEmbd)
 		copy(kEntry, ws.k)
-		vEntry := make([]float64, cfg.NEmbd)
+		vEntry := kv.slice(cfg.NEmbd)
 		copy(vEntry, ws.v)
 		kv.keys[li] = append(kv.keys[li], kEntry)
 		kv.values[li] = append(kv.values[li], vEntry)
@@ -979,10 +1053,7 @@ func gptForwardF64(m *inferModel, cfg *Config, tokenID, posID int, kv *inferKV, 
 
 func generate(params *Params, tok *Tokenizer, cfg *Config, temperature float64, rng *rand.Rand) string {
 	m := loadInferModel(params, cfg, tok.vocabSize)
-	kv := &inferKV{
-		keys:   make([][][]float64, cfg.NLayer),
-		values: make([][][]float64, cfg.NLayer),
-	}
+	kv := newInferKV(cfg.NLayer, cfg.BlockSize, cfg.NEmbd)
 	ws := newInferWorkspace(cfg, tok.vocabSize)
 
 	tokenID := tok.bos
@@ -1204,7 +1275,7 @@ func loadDocs(path string) ([]string, error) {
 func main() {
 	var cfg Config
 	var numSteps, numSamples, batchSize int
-	var lr, temperature float64
+	var lr, temperature, weightDecay float64
 	var dataFile, saveFile, loadFile string
 	var seedFlag int64
 
@@ -1221,6 +1292,7 @@ func main() {
 	flag.StringVar(&saveFile, "save", "", "save checkpoint to file after training")
 	flag.StringVar(&loadFile, "load", "", "load checkpoint from file before training")
 	flag.IntVar(&batchSize, "batch", 1, "batch size for data-parallel training (documents per step)")
+	flag.Float64Var(&weightDecay, "wd", 0, "weight decay (AdamW decoupled L2 regularization, 0 = disabled)")
 	flag.Parse()
 
 	if batchSize < 1 {
@@ -1325,7 +1397,7 @@ func main() {
 				}
 				tokens := tokenized[perm[j]]
 				lrT := computeLR(lr, step-trainStartStep, numSteps)
-				loss := trainStep(params, &cfg, tok.vocabSize, tokens, step, lrT, tape)
+				loss := trainStep(params, &cfg, tok.vocabSize, tokens, step, lrT, weightDecay, tape)
 				if math.IsNaN(loss) || math.IsInf(loss, 0) {
 					skipped++
 					consecutiveSkips++
@@ -1369,7 +1441,7 @@ func main() {
 					j++
 				}
 				lrT := computeLR(lr, step-trainStartStep, numSteps)
-				loss := trainStepBatch(params, &cfg, tok.vocabSize, tokensBatch, step, lrT, workers)
+				loss := trainStepBatch(params, &cfg, tok.vocabSize, tokensBatch, step, lrT, weightDecay, workers)
 				if math.IsNaN(loss) || math.IsInf(loss, 0) {
 					skipped++
 					consecutiveSkips++

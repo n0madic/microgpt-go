@@ -172,7 +172,7 @@ func TestTrainStepDeterministic(t *testing.T) {
 	for step := range numSteps {
 		tokens := tokenized[step%len(tokenized)]
 		lrT := computeLR(0.01, step, numSteps)
-		losses[step] = trainStep(params, cfg, tok.vocabSize, tokens, step, lrT, nil)
+		losses[step] = trainStep(params, cfg, tok.vocabSize, tokens, step, lrT, 0, nil)
 	}
 
 	for i, l := range losses {
@@ -197,7 +197,7 @@ func TestTrainStepDeterministic(t *testing.T) {
 	for step := range numSteps {
 		tokens := tokenized2[step%len(tokenized2)]
 		lrT := computeLR(0.01, step, numSteps)
-		loss := trainStep(params2, cfg, tok2.vocabSize, tokens, step, lrT, nil)
+		loss := trainStep(params2, cfg, tok2.vocabSize, tokens, step, lrT, 0, nil)
 		if loss != losses[step] {
 			t.Fatalf("step %d: expected loss %.10f, got %.10f", step, losses[step], loss)
 		}
@@ -217,17 +217,17 @@ func TestTapeReuse(t *testing.T) {
 	params1 := NewParams(cfg, tok.vocabSize, rng1)
 	tokens := tok.Encode("emma")
 	lrT := computeLR(0.01, 0, 5)
-	loss1 := trainStep(params1, cfg, tok.vocabSize, tokens, 0, lrT, nil)
+	loss1 := trainStep(params1, cfg, tok.vocabSize, tokens, 0, lrT, 0, nil)
 
 	// Run with reused tape
 	rng2 := rand.New(rand.NewPCG(42, 0))
 	params2 := NewParams(cfg, tok.vocabSize, rng2)
 	tape := NewTape(tapeInitCap)
-	_ = trainStep(params2, cfg, tok.vocabSize, tokens, 0, lrT, tape) // first use
+	_ = trainStep(params2, cfg, tok.vocabSize, tokens, 0, lrT, 0, tape) // first use
 	// Run again on the reused tape with fresh params
 	rng3 := rand.New(rand.NewPCG(42, 0))
 	params3 := NewParams(cfg, tok.vocabSize, rng3)
-	loss2 := trainStep(params3, cfg, tok.vocabSize, tokens, 0, lrT, tape)
+	loss2 := trainStep(params3, cfg, tok.vocabSize, tokens, 0, lrT, 0, tape)
 
 	if loss1 != loss2 {
 		t.Fatalf("tape reuse mismatch: fresh=%.10f reused=%.10f", loss1, loss2)
@@ -247,16 +247,13 @@ func TestInferenceMatchesTraining(t *testing.T) {
 	// Tape-based forward
 	tp := NewTape(tapeInitCap)
 	m, _ := loadModel(tp, params, cfg, tok.vocabSize)
-	kv1 := newKVCache(cfg.NLayer)
+	kv1 := newKVCache(cfg.NLayer, cfg.BlockSize, cfg.NEmbd)
 	ws := newFwdWorkspace(cfg)
 	tapeLogits := gptForward(tp, &m, cfg, tok.bos, 0, kv1, ws)
 
 	// Tape-free forward
 	im := loadInferModel(params, cfg, tok.vocabSize)
-	kv2 := &inferKV{
-		keys:   make([][][]float64, cfg.NLayer),
-		values: make([][][]float64, cfg.NLayer),
-	}
+	kv2 := newInferKV(cfg.NLayer, cfg.BlockSize, cfg.NEmbd)
 	iws := newInferWorkspace(cfg, tok.vocabSize)
 	gptForwardF64(&im, cfg, tok.bos, 0, kv2, iws)
 
@@ -283,7 +280,7 @@ func TestCheckpointRoundtrip(t *testing.T) {
 	tokens := tok.Encode("emma")
 	for step := range 3 {
 		lrT := computeLR(0.01, step, 5)
-		trainStep(params, cfg, tok.vocabSize, tokens, step, lrT, tape)
+		trainStep(params, cfg, tok.vocabSize, tokens, step, lrT, 0, tape)
 	}
 	savedStep := 3
 
@@ -338,8 +335,8 @@ func TestCheckpointRoundtrip(t *testing.T) {
 	// Verify continued training gives same result from loaded checkpoint
 	tokens2 := tok2.Encode("olivia")
 	lrT := computeLR(0.01, savedStep, 5)
-	loss1 := trainStep(params, cfg, tok.vocabSize, tokens2, savedStep, lrT, tape)
-	loss2 := trainStep(params2, cfg2, tok2.vocabSize, tokens2, savedStep, lrT, tape)
+	loss1 := trainStep(params, cfg, tok.vocabSize, tokens2, savedStep, lrT, 0, tape)
+	loss2 := trainStep(params2, cfg2, tok2.vocabSize, tokens2, savedStep, lrT, 0, tape)
 	if loss1 != loss2 {
 		t.Errorf("loss after resume: orig=%.10f loaded=%.10f", loss1, loss2)
 	}
@@ -481,6 +478,45 @@ func TestComputeLR(t *testing.T) {
 	if lr <= 0 {
 		t.Errorf("mid training: expected positive LR, got %f", lr)
 	}
+
+	// totalSteps=0 should not panic
+	lr = computeLR(0.01, 0, 0)
+	if lr != 0 {
+		t.Errorf("totalSteps=0: expected 0, got %f", lr)
+	}
+}
+
+func TestWeightDecay(t *testing.T) {
+	cfg := testConfig()
+	docs := []string{"emma", "olivia", "ava"}
+	tok := NewTokenizer(docs)
+	tokens := tok.Encode("emma")
+
+	// Train without weight decay
+	rng1 := rand.New(rand.NewPCG(42, 0))
+	params1 := NewParams(cfg, tok.vocabSize, rng1)
+	for step := range 10 {
+		lrT := computeLR(0.01, step, 10)
+		trainStep(params1, cfg, tok.vocabSize, tokens, step, lrT, 0, nil)
+	}
+
+	// Train with weight decay
+	rng2 := rand.New(rand.NewPCG(42, 0))
+	params2 := NewParams(cfg, tok.vocabSize, rng2)
+	for step := range 10 {
+		lrT := computeLR(0.01, step, 10)
+		trainStep(params2, cfg, tok.vocabSize, tokens, step, lrT, 0.1, nil)
+	}
+
+	// Weight decay should shrink parameter magnitudes
+	var normNoWD, normWD float64
+	for i := range params1.data {
+		normNoWD += params1.data[i] * params1.data[i]
+		normWD += params2.data[i] * params2.data[i]
+	}
+	if normWD >= normNoWD {
+		t.Errorf("weight decay did not reduce param norm: no_wd=%.6f wd=%.6f", normNoWD, normWD)
+	}
 }
 
 // --- Benchmarks ---
@@ -503,7 +539,7 @@ func BenchmarkTrainStep(b *testing.B) {
 	for i := range b.N {
 		tokens := tokenized[i%len(tokenized)]
 		lrT := computeLR(0.01, i%100, 100)
-		trainStep(params, cfg, tok.vocabSize, tokens, i, lrT, tape)
+		trainStep(params, cfg, tok.vocabSize, tokens, i, lrT, 0, tape)
 	}
 }
 
@@ -537,7 +573,7 @@ func TestTrainStepBatchSingleEquivalence(t *testing.T) {
 		params1 := NewParams(cfg, tok1.vocabSize, rng1)
 		tokens := tok1.Encode(docs[step%len(docs)])
 		lrT := computeLR(0.01, step, 10)
-		loss1 := trainStep(params1, cfg, tok1.vocabSize, tokens, step, lrT, nil)
+		loss1 := trainStep(params1, cfg, tok1.vocabSize, tokens, step, lrT, 0, nil)
 
 		// Run trainStepBatch with batch=1
 		rng2 := rand.New(rand.NewPCG(42, 0))
@@ -545,7 +581,7 @@ func TestTrainStepBatchSingleEquivalence(t *testing.T) {
 		params2 := NewParams(cfg, tok2.vocabSize, rng2)
 		tokens2 := tok2.Encode(docs[step%len(docs)])
 		workers := newTrainWorkers(1, cfg)
-		loss2 := trainStepBatch(params2, cfg, tok2.vocabSize, [][]int{tokens2}, step, lrT, workers)
+		loss2 := trainStepBatch(params2, cfg, tok2.vocabSize, [][]int{tokens2}, step, lrT, 0, workers)
 
 		if loss1 != loss2 {
 			t.Fatalf("step %d: trainStep loss=%.10f != trainStepBatch loss=%.10f", step, loss1, loss2)
@@ -581,7 +617,7 @@ func TestTrainStepBatchDeterministic(t *testing.T) {
 				tokenized[(step+1)%len(tokenized)],
 			}
 			lrT := computeLR(0.01, step, 5)
-			losses[step] = trainStepBatch(params, cfg, tok.vocabSize, batch, step, lrT, workers)
+			losses[step] = trainStepBatch(params, cfg, tok.vocabSize, batch, step, lrT, 0, workers)
 		}
 		return losses
 	}
@@ -616,7 +652,7 @@ func TestTrainStepBatchQuality(t *testing.T) {
 			tokenized[(step+1)%len(tokenized)],
 		}
 		lrT := computeLR(0.01, step, numSteps)
-		loss := trainStepBatch(params, cfg, tok.vocabSize, batch, step, lrT, workers)
+		loss := trainStepBatch(params, cfg, tok.vocabSize, batch, step, lrT, 0, workers)
 		if step == 0 {
 			firstLoss = loss
 		}
@@ -650,6 +686,6 @@ func BenchmarkTrainStepBatch(b *testing.B) {
 			batch[j] = tokenized[(i*4+j)%len(tokenized)]
 		}
 		lrT := computeLR(0.01, i%100, 100)
-		trainStepBatch(params, cfg, tok.vocabSize, batch, i, lrT, workers)
+		trainStepBatch(params, cfg, tok.vocabSize, batch, i, lrT, 0, workers)
 	}
 }
